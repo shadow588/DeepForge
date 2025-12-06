@@ -33,10 +33,8 @@ export const sendDeepSeekMessageStream = async function* (message: string) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: chatHistory,
-        stream: true,
-        temperature: 0.7
+        message: message,
+        history: chatHistory
       })
     });
 
