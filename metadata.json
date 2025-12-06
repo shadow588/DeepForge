@@ -1,0 +1,7 @@
+{
+  "name": "DeepForge web",
+  "description": "Forging the future of Artificial Intelligence. A showcase of premium AI solutions, experimental labs, and interactive demonstrations.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

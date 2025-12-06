@@ -1,0 +1,613 @@
+import React, { Component, useEffect, useRef, useMemo, useState, Suspense } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { OrbitControls, Stars } from '@react-three/drei';
+import { EffectComposer, Bloom } from '@react-three/postprocessing';
+import * as THREE from 'three';
+import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { RefreshCw, Play, Loader2, Maximize2 } from 'lucide-react';
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+  fallback: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+}
+
+// Error Boundary to prevent white screen crashes
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true };
+  }
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("3D Context Error:", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+
+// --- Particle Config ---
+const COUNT = 4000;
+const DAMPING = 0.92;    // Reduced damping for more fluid motion
+const STIFFNESS = 0.08;  // Increased stiffness for faster response
+
+// --- Shapes Logic ---
+const getShapePosition = (index: number, type: string, count: number): THREE.Vector3 => {
+  const vec = new THREE.Vector3();
+  const phi = Math.acos(-1 + (2 * index) / count);
+  const theta = Math.sqrt(count * Math.PI) * phi;
+  
+  if (type === 'sphere' || type === 'star') {
+    const r = type === 'star' ? 2 + Math.random() * 2 : 3;
+    vec.setFromSphericalCoords(r, phi, theta);
+  } 
+  else if (type === '1') {
+    // A vertical line
+    const y = (index / count) * 6 - 3;
+    const x = 0 + (Math.random() - 0.5) * 0.5;
+    const z = (Math.random() - 0.5) * 0.5;
+    vec.set(x, y, z);
+  } 
+  else if (type === '2') {
+    // Simple parametric curve for '2'
+    const t = (index / count) * Math.PI * 2; 
+    // Top curve
+    if (index < count * 0.5) {
+       const a = (index / (count * 0.5)) * Math.PI;
+       vec.set(Math.cos(a) * 1.5, 1.5 + Math.sin(a) * 1.5, 0);
+    } else {
+        // Bottom line
+        const a = (index - count * 0.5) / (count * 0.5);
+        vec.set(-1.5 + a * 3, -1.5, 0);
+    }
+  }
+  else if (type === '3') {
+     const t = (index / count) * 2;
+     if (t < 1) {
+         // Top half circle
+         const a = t * Math.PI - Math.PI/2;
+         vec.set(Math.cos(a) * 1.5, 1 + Math.sin(a) * 1.5, 0);
+     } else {
+         // Bottom half circle
+         const a = (t - 1) * Math.PI + Math.PI/2;
+         vec.set(Math.cos(a) * 1.5, -1 + Math.sin(a) * 1.5, 0);
+     }
+  }
+  else if (type === 'heart') {
+    const t = (index / count) * Math.PI * 2;
+    const x = 16 * Math.pow(Math.sin(t), 3);
+    const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+    vec.set(x * 0.15, y * 0.15, 0);
+  }
+  else if (type === 'saturn') {
+     if (index < count * 0.3) {
+         // Planet
+         vec.setFromSphericalCoords(1.5, phi, theta);
+     } else {
+         // Ring
+         const angle = (index / count) * Math.PI * 10;
+         const r = 3 + Math.random();
+         vec.set(Math.cos(angle) * r, (Math.random() - 0.5) * 0.2, Math.sin(angle) * r);
+         // Tilt ring
+         vec.applyAxisAngle(new THREE.Vector3(1, 0, 0), 0.5);
+     }
+  }
+  else {
+    // Cloud / Storm
+    vec.set((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 4);
+  }
+
+  return vec;
+};
+
+const Particles = ({ 
+  handData, 
+  customShape, 
+  color 
+}: { 
+  handData: any, 
+  customShape: string | null,
+  color: string 
+}) => {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const { viewport } = useThree();
+  
+  // Physics state
+  const positions = useMemo(() => new Float32Array(COUNT * 3), []);
+  const velocities = useMemo(() => new Float32Array(COUNT * 3), []);
+  const targetPositions = useMemo(() => new Float32Array(COUNT * 3), []);
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+
+  // Initialize random positions
+  useEffect(() => {
+    for (let i = 0; i < COUNT; i++) {
+      positions[i * 3] = (Math.random() - 0.5) * 10;
+      positions[i * 3 + 1] = (Math.random() - 0.5) * 10;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * 10;
+    }
+  }, []);
+
+  useFrame((state) => {
+    if (!meshRef.current) return;
+
+    // 1. Determine Target Shape
+    // Default to 'sphere' for idle state instead of 'cloud' for better initial visual
+    let shapeType = 'sphere'; 
+    let centerInfluence = new THREE.Vector3(0, 0, 0);
+    // let rotationSpeed = 0.05;
+    let repulsionStrength = 0;
+
+    if (customShape) {
+        shapeType = customShape;
+    } else if (handData && handData.detected) {
+        // Map hand scale to depth (simple approximation)
+        // larger bounding box = closer z
+        const zDepth = (handData.area - 0.1) * 20; 
+        centerInfluence.set(
+            (handData.x - 0.5) * viewport.width * -1, // Mirror x
+            (handData.y - 0.5) * viewport.height * -1,
+            zDepth
+        );
+
+        // Velocity tracking for "Storm"
+        if (handData.velocity > 0.05) {
+            repulsionStrength = handData.velocity * 50; // Storm effect
+        }
+
+        if (handData.fingers === 0) {
+            shapeType = 'star';
+        } else if (handData.fingers === 1) shapeType = '1';
+        else if (handData.fingers === 2) shapeType = '2';
+        else if (handData.fingers === 3) shapeType = '3';
+        else {
+            shapeType = 'cloud';
+        }
+    } else {
+        // IDLE ANIMATION: Gently rotating sphere
+        shapeType = 'sphere';
+    }
+
+    // 2. Physics Step
+    const time = state.clock.getElapsedTime();
+    
+    // Update target buffer roughly
+    for (let i = 0; i < COUNT; i++) {
+       const v = getShapePosition(i, shapeType, COUNT);
+       
+       // Add rotation for Star/Saturn OR Idle Sphere
+       if (shapeType === 'star' || shapeType === 'saturn' || (!handData?.detected && !customShape)) {
+           const axis = new THREE.Vector3(0, 1, 0);
+           // Slower rotation for idle
+           const speed = (!handData?.detected && !customShape) ? 0.2 : 0.5;
+           v.applyAxisAngle(axis, time * speed);
+       }
+       
+       // Apply Hand Center Offset if tracking
+       if (handData && handData.detected && !customShape) {
+           v.add(centerInfluence);
+       }
+
+       targetPositions[i * 3] = v.x;
+       targetPositions[i * 3 + 1] = v.y;
+       targetPositions[i * 3 + 2] = v.z;
+    }
+
+    // Integrate
+    for (let i = 0; i < COUNT; i++) {
+      const ix = i * 3;
+      const iy = i * 3 + 1;
+      const iz = i * 3 + 2;
+
+      // Spring force to target
+      const ax = (targetPositions[ix] - positions[ix]) * STIFFNESS;
+      const ay = (targetPositions[iy] - positions[iy]) * STIFFNESS;
+      const az = (targetPositions[iz] - positions[iz]) * STIFFNESS;
+
+      velocities[ix] += ax;
+      velocities[iy] += ay;
+      velocities[iz] += az;
+
+      // Repulsion (Storm)
+      if (repulsionStrength > 0 && handData && handData.detected) {
+          const dx = positions[ix] - centerInfluence.x;
+          const dy = positions[iy] - centerInfluence.y;
+          const dz = positions[iz] - centerInfluence.z;
+          const distSq = dx*dx + dy*dy + dz*dz;
+          if (distSq < 10 && distSq > 0.001) {
+              velocities[ix] += (dx / distSq) * repulsionStrength * 0.1;
+              velocities[iy] += (dy / distSq) * repulsionStrength * 0.1;
+              velocities[iz] += (dz / distSq) * repulsionStrength * 0.1;
+          }
+      }
+
+      // Damping
+      velocities[ix] *= DAMPING;
+      velocities[iy] *= DAMPING;
+      velocities[iz] *= DAMPING;
+
+      // Update Position
+      positions[ix] += velocities[ix];
+      positions[iy] += velocities[iy];
+      positions[iz] += velocities[iz];
+
+      // Update Instance Matrix
+      dummy.position.set(positions[ix], positions[iy], positions[iz]);
+      
+      // Scale particles based on velocity for motion blur effect
+      let speed = Math.sqrt(velocities[ix]**2 + velocities[iy]**2 + velocities[iz]**2);
+      if (isNaN(speed)) speed = 0;
+
+      let baseScale = 0.12;
+      let speedBoost = speed * 0.15;
+      let scale = Math.min(0.25, baseScale + speedBoost);
+      if (isNaN(scale)) scale = 0.12;
+
+      dummy.scale.set(scale, scale, scale);
+      dummy.updateMatrix();
+      meshRef.current.setMatrixAt(i, dummy.matrix);
+    }
+    
+    meshRef.current.instanceMatrix.needsUpdate = true;
+  });
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, COUNT]}>
+      <sphereGeometry args={[1, 12, 12]} />
+      <meshStandardMaterial
+        color={color}
+        emissive={color}
+        emissiveIntensity={2.0}
+        toneMapped={false}
+      />
+    </instancedMesh>
+  );
+};
+
+const ParticleDemo: React.FC = () => {
+  const [started, setStarted] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mountedRef = useRef(true);
+  const [handData, setHandData] = useState({ 
+      detected: false, 
+      fingers: 5, 
+      x: 0, 
+      y: 0, 
+      area: 0,
+      velocity: 0
+  });
+  const prevHandPos = useRef({ x: 0, y: 0, time: 0 });
+
+  // Smoothing buffers for gesture stability
+  const smoothingBuffers = useRef({
+    fingers: 5,
+    velocity: 0,
+    x: 0,
+    y: 0,
+    area: 0
+  });
+  const smoothingAlpha = 0.3;
+
+  // Shape change hysteresis
+  const shapeChangeTimer = useRef({
+    lastShape: 'sphere',
+    changeTime: 0,
+    pending: null
+  });
+
+  // UI Controls
+  const [activeShape, setActiveShape] = useState<string | null>(null);
+  const [particleColor, setParticleColor] = useState('#E5E7EB'); // Silver default
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // Cleanup video tracks if running
+      if (videoRef.current && videoRef.current.srcObject) {
+         const stream = videoRef.current.srcObject as MediaStream;
+         stream.getTracks().forEach(t => t.stop());
+      }
+    };
+  }, []);
+
+  const toggleFullscreen = () => {
+      if (!containerRef.current) return;
+      if (!document.fullscreenElement) {
+          containerRef.current.requestFullscreen().catch(err => {
+              console.error(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
+          });
+      } else {
+          document.exitFullscreen();
+      }
+  };
+
+  const startExperience = async () => {
+    setLoading(true);
+    try {
+        await setupVision();
+        if (mountedRef.current) setStarted(true);
+    } catch(e) {
+        console.error("Failed to start vision", e);
+        // We allow starting even if camera fails, so we can see the particles
+        if (mountedRef.current) setStarted(true);
+    } finally {
+        if (mountedRef.current) setLoading(false);
+    }
+  };
+
+  const setupVision = async () => {
+    let vision: HandLandmarker;
+
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm"
+    );
+    vision = await HandLandmarker.createFromOptions(filesetResolver, {
+      baseOptions: {
+        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 1
+    });
+
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (mountedRef.current && videoRef.current) {
+            videoRef.current.srcObject = stream;
+            videoRef.current.onloadedmetadata = () => {
+                if (videoRef.current) videoRef.current.play();
+            };
+            // Fallback play if event doesn't fire
+            videoRef.current.play().catch(e => console.warn("Auto-play failed", e));
+            startPredictionLoop(vision);
+        } else {
+             // If component unmounted during async setup
+             stream.getTracks().forEach(track => track.stop());
+        }
+      } catch (err) {
+        console.warn("Camera permission denied or unavailable", err);
+        throw err;
+      }
+    }
+  };
+
+  const startPredictionLoop = (vision: HandLandmarker) => {
+    // Robust finger detection using vector distance
+    const detectFingerExtended = (tip: any, pip: any, mcp: any, wrist: any): boolean => {
+      const tipToWrist = Math.sqrt(
+        Math.pow(tip.x - wrist.x, 2) +
+        Math.pow(tip.y - wrist.y, 2) +
+        Math.pow(tip.z - wrist.z, 2)
+      );
+      const pipToWrist = Math.sqrt(
+        Math.pow(pip.x - wrist.x, 2) +
+        Math.pow(pip.y - wrist.y, 2) +
+        Math.pow(pip.z - wrist.z, 2)
+      );
+      return tipToWrist > pipToWrist * 1.1;
+    };
+
+    const detectThumbExtended = (lm: any[]): boolean => {
+      const thumbTip = lm[4];
+      const indexMcp = lm[5];
+      const thumbDist = Math.sqrt(
+        Math.pow(thumbTip.x - indexMcp.x, 2) +
+        Math.pow(thumbTip.y - indexMcp.y, 2)
+      );
+      return thumbDist > 0.08;
+    };
+
+    const predict = () => {
+        if (!mountedRef.current || !vision) return;
+        
+        // Safety check for video element
+        if (!videoRef.current) {
+             if (mountedRef.current) requestAnimationFrame(predict);
+             return;
+        }
+
+        const startTimeMs = performance.now();
+        // Check if video is actually ready and has dimensions
+        if (videoRef.current.readyState >= 2 && videoRef.current.videoWidth > 0) {
+             try {
+                const result = vision.detectForVideo(videoRef.current, startTimeMs);
+                
+                if (result.landmarks && result.landmarks.length > 0) {
+                    const lm = result.landmarks[0];
+                    
+                    // Calculate Center
+                    const cx = (lm[0].x + lm[9].x) / 2;
+                    const cy = (lm[0].y + lm[9].y) / 2;
+                    
+                    const minX = Math.min(...lm.map(p => p.x));
+                    const maxX = Math.max(...lm.map(p => p.x));
+                    const minY = Math.min(...lm.map(p => p.y));
+                    const maxY = Math.max(...lm.map(p => p.y));
+                    const area = (maxX - minX) * (maxY - minY);
+
+                    // Robust finger detection with confidence filtering
+                    const wrist = lm[0];
+                    let fingers = 0;
+                    if (detectFingerExtended(lm[8], lm[6], lm[5], wrist)) fingers++; // Index
+                    if (detectFingerExtended(lm[12], lm[10], lm[9], wrist)) fingers++; // Middle
+                    if (detectFingerExtended(lm[16], lm[14], lm[13], wrist)) fingers++; // Ring
+                    if (detectFingerExtended(lm[20], lm[18], lm[17], wrist)) fingers++; // Pinky
+                    if (detectThumbExtended(lm)) fingers++; // Thumb
+
+                    // Confidence filtering
+                    const avgConfidence = lm.reduce((sum: number, p: any) => sum + (p.visibility || 1), 0) / lm.length;
+                    if (avgConfidence < 0.7) {
+                        // Low confidence - skip this frame
+                        if (mountedRef.current) requestAnimationFrame(predict);
+                        return;
+                    }
+
+                    // Calculate Velocity
+                    const now = performance.now() / 1000;
+                    const dt = now - prevHandPos.current.time;
+                    const dist = Math.sqrt(Math.pow(cx - prevHandPos.current.x, 2) + Math.pow(cy - prevHandPos.current.y, 2));
+                    const velocity = dt > 0 ? dist / dt : 0;
+                    
+                    prevHandPos.current = { x: cx, y: cy, time: now };
+
+                    // Apply exponential smoothing for stability
+                    const smoothed = {
+                        fingers: Math.round(
+                            smoothingBuffers.current.fingers * (1 - smoothingAlpha) + fingers * smoothingAlpha
+                        ),
+                        velocity: smoothingBuffers.current.velocity * (1 - smoothingAlpha) + velocity * smoothingAlpha,
+                        x: smoothingBuffers.current.x * (1 - smoothingAlpha) + cx * smoothingAlpha,
+                        y: smoothingBuffers.current.y * (1 - smoothingAlpha) + cy * smoothingAlpha,
+                        area: smoothingBuffers.current.area * (1 - smoothingAlpha) + area * smoothingAlpha
+                    };
+                    smoothingBuffers.current = smoothed;
+
+                    if (mountedRef.current) {
+                        setHandData({
+                            detected: true,
+                            ...smoothed
+                        });
+                    }
+                } else {
+                    if (mountedRef.current) setHandData(prev => ({ ...prev, detected: false }));
+                }
+             } catch (e) {
+                 // Ignore frame errors
+             }
+        }
+        if (mountedRef.current) requestAnimationFrame(predict);
+    };
+    predict();
+  };
+
+  return (
+    <div ref={containerRef} className="relative w-full h-[600px] bg-black rounded-xl overflow-hidden shadow-2xl group transition-all duration-500">
+      {/* Hidden Video for CV */}
+      <video ref={videoRef} className="absolute opacity-0 pointer-events-none w-64 h-48" playsInline muted autoPlay />
+      
+      {!started ? (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-zinc-900/50 backdrop-blur-sm">
+             <div className="p-8 rounded-3xl bg-white/10 backdrop-blur-md border border-white/20 shadow-2xl text-center max-w-md mx-4">
+                 <h3 className="text-2xl font-bold text-white mb-2 tracking-tight">Particle Reality</h3>
+                 <p className="text-white/70 mb-8 text-sm leading-relaxed">
+                     An immersive WebAR experience driven by your hand gestures. 
+                     Camera access is required for computer vision.
+                 </p>
+                 <button 
+                    onClick={startExperience}
+                    disabled={loading}
+                    className="group relative inline-flex items-center gap-2 px-8 py-4 bg-white text-black rounded-full font-semibold hover:scale-105 transition-all disabled:opacity-70 disabled:hover:scale-100"
+                 >
+                    {loading ? <Loader2 className="animate-spin" size={20} /> : <Play size={20} fill="currentColor" />}
+                    <span>{loading ? 'Initializing...' : 'Enter Experience'}</span>
+                 </button>
+             </div>
+        </div>
+      ) : (
+        <ErrorBoundary fallback={
+          <div className="absolute inset-0 flex items-center justify-center bg-zinc-900 text-white">
+            <div className="text-center p-6">
+              <h3 className="text-xl font-bold mb-2">Visual Engine Error</h3>
+              <p className="text-sm opacity-60">The 3D context could not be initialized.</p>
+              <button onClick={() => window.location.reload()} className="mt-4 px-4 py-2 bg-white text-black rounded-full text-sm">
+                Reload Page
+              </button>
+            </div>
+          </div>
+        }>
+          <Suspense fallback={<div className="absolute inset-0 flex items-center justify-center text-white/50">Loading Assets...</div>}>
+            <Canvas camera={{ position: [0, 0, 15], fov: 45 }}>
+                <color attach="background" args={['#0f0f0f']} />
+                <ambientLight intensity={0.3} color="#ffffff" />
+                <directionalLight position={[5, 10, 5]} intensity={1.5} color="#ffffff" />
+                <pointLight position={[-10, 0, -10]} intensity={0.8} color="#60A5FA" distance={30} />
+                <pointLight position={[0, 0, 15]} intensity={1.2} color={particleColor} />
+                <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
+                <Particles handData={handData} customShape={activeShape} color={particleColor} />
+                <OrbitControls enableZoom={false} enablePan={false} />
+            </Canvas>
+
+            {/* Overlay UI */}
+            <div className="absolute top-6 left-6 text-white/80 font-mono text-xs pointer-events-none animate-fade-in z-10">
+                <div>System: Particle Reality Engine</div>
+                <div className="flex items-center gap-2">Status: 
+                    <span className={`inline-block w-2 h-2 rounded-full ${handData.detected ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500'}`}></span>
+                    {handData.detected ? 'HAND DETECTED' : 'SEARCHING INPUT'}
+                </div>
+                {handData.detected && (
+                    <div className="mt-2 text-white/50">
+                        Fingers: {handData.fingers} <br/>
+                        Velocity: {handData.velocity.toFixed(2)}
+                    </div>
+                )}
+            </div>
+
+            {/* Controls */}
+            <div className="absolute top-1/2 right-4 -translate-y-1/2 flex flex-col gap-3 animate-fade-in z-10">
+                <button 
+                    onClick={toggleFullscreen}
+                    className="p-3 rounded-full backdrop-blur-md bg-white/10 text-white hover:bg-white/20 transition-all mb-4 border border-white/10"
+                    title="Toggle Fullscreen"
+                >
+                    <Maximize2 size={20} />
+                </button>
+
+                <button 
+                    onClick={() => setActiveShape(null)}
+                    className={`p-3 rounded-full backdrop-blur-md transition-all ${activeShape === null ? 'bg-white/20 text-white' : 'bg-black/20 text-white/50 hover:bg-white/10'}`}
+                    title="Hand Control Mode"
+                >
+                    <RefreshCw size={20} />
+                </button>
+                
+                <div className="w-10 h-[1px] bg-white/10 mx-auto"></div>
+
+                {['heart', 'saturn', 'star'].map((shape) => (
+                    <button
+                    key={shape}
+                    onClick={() => setActiveShape(shape)}
+                    className={`w-10 h-10 rounded-full flex items-center justify-center backdrop-blur-md border border-white/10 text-[10px] font-bold uppercase transition-all
+                        ${activeShape === shape ? 'bg-white text-black scale-110 shadow-lg shadow-white/20' : 'bg-black/40 text-white hover:bg-white/20'}
+                    `}
+                    >
+                        {shape.charAt(0)}
+                    </button>
+                ))}
+                
+                <div className="w-10 h-[1px] bg-white/10 mx-auto mt-2"></div>
+                
+                {['#FCD34D', '#E5E7EB', '#F472B6', '#60A5FA'].map((col) => (
+                    <button
+                        key={col}
+                        onClick={() => setParticleColor(col)}
+                        className={`w-6 h-6 rounded-full border-2 transition-all ${particleColor === col ? 'border-white scale-125' : 'border-transparent opacity-50'}`}
+                        style={{ backgroundColor: col }}
+                    />
+                ))}
+            </div>
+            
+            <div className="absolute bottom-4 left-0 right-0 text-center pointer-events-none z-10">
+                <p className="text-white/40 text-xs font-light uppercase tracking-widest">
+                    {activeShape ? `Displaying: ${activeShape}` : 'Gesture Control Active'}
+                </p>
+            </div>
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </div>
+  );
+};
+
+export default ParticleDemo;
