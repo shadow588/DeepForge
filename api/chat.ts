@@ -1,5 +1,3 @@
-import { NextRequest } from 'next/server';
-
 // 简单的内存存储（冷启动会重置，但提供基本防护）
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 
@@ -10,7 +8,7 @@ const MAX_INPUT_LENGTH = 2000;
 const MAX_TOKENS = 1000;
 const TIMEOUT = 30000; // 30秒
 
-function getClientIp(request: NextRequest): string {
+function getClientIp(request: Request): string {
   return request.headers.get('x-forwarded-for')?.split(',')[0] ||
          request.headers.get('x-real-ip') ||
          'unknown';
@@ -37,7 +35,7 @@ export const config = {
   runtime: 'edge',
 };
 
-export default async function handler(request: NextRequest) {
+export default async function handler(request: Request) {
   // CORS处理
   if (request.method === 'OPTIONS') {
     return new Response(null, {
