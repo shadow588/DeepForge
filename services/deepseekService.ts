@@ -51,21 +51,30 @@ export const sendDeepSeekMessageStream = async function* (message: string) {
     }
 
     const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder('utf-8');
     let fullResponse = '';
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const lines = decoder.decode(value).split('\n').filter(l => l.startsWith('data: '));
+      // Use stream: true to handle incomplete UTF-8 characters
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+
+      // Keep the last incomplete line in buffer
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
-        const data = line.slice(6);
+        if (!line.startsWith('data: ')) continue;
+
+        const data = line.slice(6).trim();
         if (data === '[DONE]') continue;
 
         try {
-          const content = JSON.parse(data).choices[0]?.delta?.content;
+          const parsed = JSON.parse(data);
+          const content = parsed.choices[0]?.delta?.content;
           if (content) {
             fullResponse += content;
             yield content;

@@ -80,7 +80,7 @@ const Lab: React.FC = () => {
     <div className="flex flex-col h-[calc(100vh-64px)] max-w-3xl mx-auto w-full px-4 sm:px-0">
       
       {/* Messages Area */}
-      <div className="flex-grow overflow-y-auto py-8 space-y-8 scrollbar-hide">
+      <div className="flex-grow overflow-y-auto py-8 pr-4 space-y-8 scrollbar-hide">
         {messages.map((msg, index) => (
           <div
             key={index}
